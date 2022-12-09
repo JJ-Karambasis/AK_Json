@@ -66,7 +66,7 @@ AK_JSON_DEF void               AK_Json_Delete(ak_json_context* Context);
 AK_JSON_DEF ak_json_error_code AK_Json_Get_Error_Code();
 AK_JSON_DEF ak_json_str        AK_Json_Get_Error_Message();
 
-AK_JSON_DEF ak_json_key*   AK_Json_Parse(ak_json_context* Context, ak_json_str Str);
+AK_JSON_DEF ak_json_value* AK_Json_Parse(ak_json_context* Context, ak_json_str Str);
 
 AK_JSON_DEF ak_json_str    AK_Json_Key_Get_Name(ak_json_key* Key);
 AK_JSON_DEF ak_json_value* AK_Json_Key_Get_Value(ak_json_key* Key);
@@ -198,6 +198,11 @@ static int AK_Json__Is_Digit(ak_json_u8 C)
     return C >= '0' && C <= '9';
 }
 
+static int AK_Json__Is_Hex_Digit(ak_json_u8 C)
+{
+    return AK_Json__Is_Digit(C) || (C >= 'a' && C <= 'f') || (C >= 'A' && C <= 'F');
+}
+
 static ak_json_u64 AK_Json__Copy_Whitespace(ak_json_u8* Buffer, ak_json_str Line)
 {
     ak_json_u64 Index;
@@ -234,6 +239,14 @@ typedef struct ak_json__arena
     ak_json__arena_block* CurrentBlock;
     unsigned int          InitialBlockSize;
 } ak_json__arena;
+
+typedef struct ak_json__arena_reserve
+{
+    ak_json__arena* Arena;
+    ak_json__arena_block* Block;
+    ak_json_u64     Used;
+    ak_json_u64     Size;
+} ak_json__arena_reserve;
 
 static ak_json__arena* AK_Json__Arena_Create(ak_json_allocator Allocator, unsigned int InitialBlockSize)
 {
@@ -333,9 +346,62 @@ static void* AK_Json__Arena_Push(ak_json__arena* Arena, unsigned int Size)
     return Result;
 }
 
+static ak_json__arena_reserve AK_Json__Arena_Begin_Reserve(ak_json__arena* Arena, unsigned int Size)
+{
+    ak_json__arena_reserve Reserve;
+    Reserve.Size = 0;
+    Reserve.Arena  = NULL;
+    if(!Size) return Reserve;
+    
+    ak_json__arena_block* Block = AK_Json__Arena_Get_Block(Arena, Size);
+    if(!Block)
+    {
+        unsigned int BlockSize = AK_Json__Max(Arena->InitialBlockSize, Size);
+        Block = AK_Json__Arena_Create_Block(Arena, BlockSize);
+        if(!Block) return Reserve;
+        AK_Json__Arena_Add_Block(Arena, Block);
+    }
+    
+    Arena->CurrentBlock = Block;
+    AK_JSON_ASSERT(Arena->CurrentBlock->Used+Size <= Arena->CurrentBlock->Size);
+    
+    Reserve.Size = Size;
+    Reserve.Arena  = Arena;
+    Reserve.Block = Arena->CurrentBlock;
+    Reserve.Used  = 0;
+    
+    return Reserve;
+}
+
+static void* AK_Json__Arena_Push_Reserve(ak_json__arena_reserve* Reserve, unsigned int Size)
+{
+    AK_JSON_ASSERT(Reserve->Block->Used+Reserve->Used+Size <= Reserve->Block->Size);
+    void* Result = Reserve->Block->Memory + Reserve->Block->Used + Reserve->Used;
+    Reserve->Used += Size;
+    return Result;
+}
+
+static void AK_Json__Arena_End_Reserve(ak_json__arena* Arena, ak_json__arena_reserve* Reserve)
+{
+    Reserve->Block->Used += Reserve->Used;
+}
+
+static ak_json_u8* AK_Json__Arena_Reserve_Get_Memory(ak_json__arena_reserve* Reserve)
+{
+    ak_json_u8* Result = Reserve->Block->Memory + Reserve->Block->Used;
+    return Result;
+}
+
 /**************
 *** Strings ***
 ***************/
+
+#define AK_JSON__BIT_8  0x00000080
+#define AK_JSON__BITMASK_2  0x00000003
+#define AK_JSON__BITMASK_3  0x00000007
+#define AK_JSON__BITMASK_4  0x0000000f
+#define AK_JSON__BITMASK_5  0x0000001f
+#define AK_JSON__BITMASK_6  0x0000003f
 
 AK_JSON_DEF ak_json_str AK_Json_Str_Create(const ak_json_u8* Str, ak_json_u64 Length)
 { 
@@ -379,6 +445,107 @@ static int AK_Json_Str__Equal(ak_json_str StrA, ak_json_str StrB)
             return 0;
     }
     return 1;
+}
+
+unsigned int AK_Json__Get_UTF8_Bytecount(unsigned int Codepoint)
+{
+    unsigned int Result = 0;
+    if (Codepoint <= 0x7F)
+    {
+        Result = 1;
+    }
+    else if (Codepoint <= 0x7FF)
+    {
+        Result = 2;
+    }
+    else if (Codepoint <= 0xFFFF)
+    {
+        Result = 3;
+    }
+    else if (Codepoint <= 0x10FFFF)
+    {
+        Result = 4;
+    }
+    else
+    {
+        AK_JSON_ASSERT(0);
+    }
+    return Result;
+}
+
+void AK_Json__UTF8_From_Codepoint(unsigned int Codepoint, ak_json_u8* Buffer)
+{
+    unsigned int Offset = 0;
+    if (Codepoint <= 0x7F)
+    {
+        Buffer[0] = (ak_json_u8)Codepoint;
+        Offset = 1;
+    }
+    else if (Codepoint <= 0x7FF)
+    {
+        Buffer[0] = (AK_JSON__BITMASK_2 << 6) | ((Codepoint >> 6) & AK_JSON__BITMASK_5);
+        Buffer[1] = AK_JSON__BIT_8 | (Codepoint & AK_JSON__BITMASK_6);
+        Offset = 2;
+    }
+    else if (Codepoint <= 0xFFFF)
+    {
+        Buffer[0] = (AK_JSON__BITMASK_3 << 5) | ((Codepoint >> 12) & AK_JSON__BITMASK_4);
+        Buffer[1] = AK_JSON__BIT_8 | ((Codepoint >> 6) & AK_JSON__BITMASK_6);
+        Buffer[2] = AK_JSON__BIT_8 | ( Codepoint       & AK_JSON__BITMASK_6);
+        Offset = 3;
+    }
+    else if (Codepoint <= 0x10FFFF)
+    {
+        Buffer[0] = (AK_JSON__BITMASK_4 << 3) | ((Codepoint >> 18) & AK_JSON__BITMASK_3);
+        Buffer[1] = AK_JSON__BIT_8 | ((Codepoint >> 12) & AK_JSON__BITMASK_6);
+        Buffer[2] = AK_JSON__BIT_8 | ((Codepoint >>  6) & AK_JSON__BITMASK_6);
+        Buffer[3] = AK_JSON__BIT_8 | ( Codepoint        & AK_JSON__BITMASK_6);
+        Offset = 4;
+    }
+    else
+    {
+        AK_JSON_ASSERT(0);
+    }
+}
+
+ak_json_str AK_Json__Json_Str_To_UTF8(ak_json__arena* Arena, ak_json_str JsonStr)
+{
+    ak_json__arena_reserve Reserve = AK_Json__Arena_Begin_Reserve(Arena, JsonStr.Length+1);
+    
+    ak_json_u64 Index;
+    for(Index = 0; Index < JsonStr.Length; Index++)
+    {
+        if(JsonStr.Str[Index] == '\\')
+        {
+            if(JsonStr.Str[Index+1] == 'u')
+            {
+                unsigned int Codepoint = ((JsonStr.Str[Index+5] << 24) | 
+                                          (JsonStr.Str[Index+4] << 16) | 
+                                          (JsonStr.Str[Index+3] << 8)  | 
+                                          (JsonStr.Str[Index+2] << 0));
+                unsigned int ByteCount = AK_Json__Get_UTF8_Bytecount(Codepoint);
+                ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, ByteCount);
+                AK_Json__UTF8_From_Codepoint(Codepoint, Memory);
+                Index += 5;
+                continue;
+            }
+        }
+        
+        ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+        *Memory = JsonStr.Str[Index];
+    }
+    
+    ak_json_str Result;
+    Result.Length = Reserve.Used;
+    
+    ak_json_u8* Memory = AK_Json__Arena_Reserve_Get_Memory(&Reserve);
+    
+    Memory[Reserve.Used] = 0;
+    Result.Str = (const ak_json_u8*)Memory;
+    
+    AK_Json__Arena_End_Reserve(Arena, &Reserve);
+    
+    return Result;
 }
 
 /************************
@@ -646,6 +813,7 @@ typedef enum ak_json__token_type
     AK_JSON__TOKEN_TYPE_NULL,
     AK_JSON__TOKEN_TYPE_BOOLEAN,
     AK_JSON__TOKEN_TYPE_NUMBER,
+    AK_JSON__TOKEN_TYPE_STRING
 } ak_json__token_type;
 
 typedef struct ak_json__token
@@ -696,6 +864,10 @@ static ak_json__token* AK_Json__Tokenizer_Allocate_Token(ak_json__tokenizer* Tok
     return Token;
 }
 
+#define AK_Json__Return_Undefined(Char) \
+ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, Char); \
+return 0
+
 static int AK_Json__Tokenize_Null(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
 {
     ak_json__char Char1 = AK_Json__Stream_Consume_Char(Stream);
@@ -716,8 +888,7 @@ static int AK_Json__Tokenize_Null(ak_json__tokenizer* Tokenizer, ak_json__stream
         }
     }
     
-    ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, Char1);
-    return 0;
+    AK_Json__Return_Undefined(Char1);
 }
 
 static int AK_Json__Tokenize_Boolean(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
@@ -749,8 +920,7 @@ static int AK_Json__Tokenize_Boolean(ak_json__tokenizer* Tokenizer, ak_json__str
         }
     }
     
-    ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, Char1);
-    return 0;
+    AK_Json__Return_Undefined(Char1);
 }
 
 static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
@@ -764,8 +934,7 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
         {
             if(!AK_Json__Stream_Is_Valid(Stream))
             {
-                ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                return 0;
+                AK_Json__Return_Undefined(StartChar);
             }
             
             Char = AK_Json__Stream_Consume_Char(Stream);
@@ -778,8 +947,7 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
             ak_json__char Char = AK_Json__Stream_Peek_Char(Stream);
             if(IsZero && AK_Json__Is_Digit(Char.Char))
             {
-                ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                return 0;
+                AK_Json__Return_Undefined(StartChar);
             }
             
             if(Char.Char == '.') 
@@ -792,14 +960,12 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
                         AK_Json__Stream_Eat_Digits(Stream);
                     else
                     {
-                        ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                        return 0;
+                        AK_Json__Return_Undefined(StartChar);
                     }
                 }
                 else
                 {
-                    ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                    return 0;
+                    AK_Json__Return_Undefined(StartChar);
                 }
             }
             
@@ -811,8 +977,7 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
                     AK_Json__Stream_Increment(Stream);
                     if(!AK_Json__Stream_Is_Valid(Stream))
                     {
-                        ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                        return 0;
+                        AK_Json__Return_Undefined(StartChar);
                     }
                     
                     Char = AK_Json__Stream_Peek_Char(Stream);
@@ -821,8 +986,7 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
                         AK_Json__Stream_Increment(Stream);
                         if(!AK_Json__Stream_Is_Valid(Stream))
                         {
-                            ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                            return 0;
+                            AK_Json__Return_Undefined(StartChar);
                         }
                         
                         Char = AK_Json__Stream_Peek_Char(Stream);
@@ -832,8 +996,7 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
                         AK_Json__Stream_Eat_Digits(Stream);
                     else
                     {
-                        ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-                        return 0;
+                        AK_Json__Return_Undefined(StartChar);
                     }
                 }
             }
@@ -845,10 +1008,80 @@ static int AK_Json__Tokenize_Number(ak_json__tokenizer* Tokenizer, ak_json__stre
     }
     else
     {
-        ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
-        return 0;
+        AK_Json__Return_Undefined(StartChar);
     }
 }
+
+static int AK_Json__Tokenize_String(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
+{
+    ak_json__char StartChar = AK_Json__Stream_Consume_Char(Stream);
+    AK_JSON_ASSERT(StartChar.Char == '"');
+    
+    while(AK_Json__Stream_Is_Valid(Stream))
+    {
+        ak_json__char Char = AK_Json__Stream_Consume_Char(Stream);
+        
+        if(Char.Char == '"')
+        {
+            ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_STRING, StartChar);
+            Token->Length = Stream->StrIndex-StartChar.Index;
+            return 1;
+        }
+        else if(Char.Char == '\\')
+        {
+            if(AK_Json__Stream_Is_Valid(Stream))
+            {
+                ak_json__char ControlChar = AK_Json__Stream_Consume_Char(Stream);
+                switch(ControlChar.Char)
+                {
+                    case '"':
+                    case '\\':
+                    case '/':
+                    case 'b':
+                    case 'f':
+                    case 'n':
+                    case 'r':
+                    case 't':
+                    {
+                        //NOTE(EVERYONE): Noop. These are the valid control points
+                    } break;
+                    
+                    case 'u':
+                    {
+                        ak_json_u64 Remaining = AK_Json__Stream_Get_Remaining(Stream);
+                        if(Remaining >= 4)
+                        {
+                            ak_json_u64 Index;
+                            for(Index = 0; Index < 4; Index++)
+                            {
+                                ak_json__char UnicodeChar = AK_Json__Stream_Consume_Char(Stream);
+                                if(!AK_Json__Is_Hex_Digit(UnicodeChar.Char))
+                                    AK_Json__Return_Undefined(StartChar);
+                            }
+                        }
+                        else
+                        {
+                            AK_Json__Return_Undefined(StartChar);
+                        }
+                    } break;
+                    
+                    default:
+                    {
+                        AK_Json__Return_Undefined(StartChar);
+                    } break;
+                }
+            }
+            else
+            {
+                AK_Json__Return_Undefined(StartChar);
+            }
+        }
+    }
+    
+    AK_Json__Return_Undefined(StartChar);
+}
+
+#undef AK_Json__Return_Undefined
 
 static int AK_Json__Tokenize_Value(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
 {
@@ -859,11 +1092,6 @@ static int AK_Json__Tokenize_Value(ak_json__tokenizer* Tokenizer, ak_json__strea
     int Result = 1;
     switch(Char.Char)
     {
-        case '"':
-        {
-            //AK_Json__Tokenize_String(Tokenizer, Stream);
-        } break;
-        
         case 'n':
         {
             Result = AK_Json__Tokenize_Null(Tokenizer, Stream);
@@ -880,6 +1108,15 @@ static int AK_Json__Tokenize_Value(ak_json__tokenizer* Tokenizer, ak_json__strea
             if(!Result)
             {
                 AK_Json__Error_Log(Tokenizer->ErrorArena, Stream->Str, AK_JSON_ERROR_CODE_UNDEFINED_TOKEN, Char, AK_Json_Str("Expecting boolean value. Got undefined."));
+            }
+        } break;
+        
+        case '"':
+        {
+            Result = AK_Json__Tokenize_String(Tokenizer, Stream);
+            if(!Result)
+            {
+                AK_Json__Error_Log(Tokenizer->ErrorArena, Stream->Str, AK_JSON_ERROR_CODE_UNDEFINED_TOKEN, Char, AK_Json_Str("Expecting string value. Got undefined."));
             }
         } break;
         
@@ -1003,15 +1240,17 @@ static ak_json_value* AK_Json__Parse_Number_Value(ak_json__arena* Arena, ak_json
     return Value;
 }
 
-static ak_json_key* AK_Json__Key_Create_Raw(ak_json_context* Context, ak_json_str Str)
+static ak_json_value* AK_Json__Parse_String_Value(ak_json__arena* Arena, ak_json_str Str, ak_json__token* Token)
 {
-    ak_json_key* Key = Context->FreeKeys;
-    if(!Key) Key = (ak_json_key*)AK_Json__Arena_Push(Context->Arena, sizeof(ak_json_key));
-    else Context->FreeKeys = Context->FreeKeys->Next;
+    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_STRING);
     
-    Key->Value = NULL;
-    Key->Str   = Str;
-    return Key;
+    ak_json_str TokenStr = AK_Json__Token_Get_Str(Str, Token);
+    
+    ak_json_value* Value = (ak_json_value*)AK_Json__Arena_Push(Arena, sizeof(ak_json_value));
+    Value->Type = AK_JSON_VALUE_TYPE_STRING;
+    Value->String = AK_Json__Json_Str_To_UTF8(Arena, TokenStr);
+    
+    return Value;
 }
 
 static ak_json_value* AK_Json__Value_Copy(ak_json_context* Context, ak_json_value* CopyValue)
@@ -1057,15 +1296,7 @@ static ak_json_value* AK_Json__Value_Copy(ak_json_context* Context, ak_json_valu
     return Value;
 }
 
-static ak_json_key* AK_Json__Generate_Root_Hierarchy(ak_json_context* Context, ak_json_value* RootValue)
-{
-    ak_json_key* Key = AK_Json__Key_Create_Raw(Context, AK_Json_Str("Root"));
-    ak_json_value* Value = AK_Json__Value_Copy(Context, RootValue);
-    Key->Value = Value;
-    return Key;
-}
-
-AK_JSON_DEF ak_json_key* AK_Json_Parse(ak_json_context* Context, ak_json_str Str)
+AK_JSON_DEF ak_json_value* AK_Json_Parse(ak_json_context* Context, ak_json_str Str)
 {
     ak_json__arena* ParseArena = AK_Json__Arena_Create(Context->Arena->Allocator, Str.Length*2);
     if(!ParseArena) return NULL;
@@ -1100,6 +1331,11 @@ AK_JSON_DEF ak_json_key* AK_Json_Parse(ak_json_context* Context, ak_json_str Str
             RootValue = AK_Json__Parse_Number_Value(ParseArena, Str, Token);
         } break;
         
+        case AK_JSON__TOKEN_TYPE_STRING:
+        {
+            RootValue = AK_Json__Parse_String_Value(ParseArena, Str, Token);
+        } break;
+        
         default:
         {
             //NOTE(EVERYONE): This shouldn't occur
@@ -1107,11 +1343,11 @@ AK_JSON_DEF ak_json_key* AK_Json_Parse(ak_json_context* Context, ak_json_str Str
         } break;
     }
     
-    ak_json_key* RootKey = NULL;
-    if(RootValue) RootKey = AK_Json__Generate_Root_Hierarchy(Context, RootValue);
+    ak_json_value* Result = NULL;
+    if(RootValue) Result = AK_Json__Value_Copy(Context, RootValue);
     
     AK_Json__Arena_Delete(ParseArena);
-    return RootKey;
+    return Result;
 }
 
 /***********
