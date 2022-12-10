@@ -200,7 +200,10 @@ static int AK_Json__Is_Digit(ak_json_u8 C)
 
 static int AK_Json__Is_Hex_Digit(ak_json_u8 C)
 {
-    return AK_Json__Is_Digit(C) || (C >= 'a' && C <= 'f') || (C >= 'A' && C <= 'F');
+    int p0 = (C >= 'a' && C <= 'f');
+    int p1 = (C >= 'A' && C <= 'F');
+    int p2 = AK_Json__Is_Digit(C);
+    return p0 || p1 || p2;
 }
 
 static ak_json_u64 AK_Json__Copy_Whitespace(ak_json_u8* Buffer, ak_json_str Line)
@@ -411,6 +414,14 @@ AK_JSON_DEF ak_json_str AK_Json_Str_Create(const ak_json_u8* Str, ak_json_u64 Le
 
 static ak_json_str AK_Json_Str__Copy(ak_json__arena* Arena, ak_json_str Str)
 {
+    if(!Str.Length)
+    {
+        ak_json_str Result;
+        Result.Length = 0;
+        Result.Str = NULL;
+        return Result;
+    }
+    
     ak_json_str Result;
     Result.Length = Str.Length;
     char* Buffer = (char*)AK_Json__Arena_Push(Arena, Str.Length+1);
@@ -504,12 +515,33 @@ void AK_Json__UTF8_From_Codepoint(unsigned int Codepoint, ak_json_u8* Buffer)
     }
     else
     {
+        //TODO(JJ): We probably do need to handle this case
         AK_JSON_ASSERT(0);
     }
 }
 
+
+unsigned int AK_Json__UTF16_To_UTF32(unsigned int Value)
+{
+    unsigned int FirstHalf = Value & 0xFFFF;
+    unsigned int SecondHalf = (Value >> 16) & 0xFFFF;
+    unsigned int Result = FirstHalf;
+    if (0xD800 <= FirstHalf && FirstHalf < 0xDC00 && 0xDC00 <= SecondHalf && SecondHalf < 0xE000){
+        Result = ((FirstHalf - 0xD800) << 10) | (SecondHalf - 0xDC00);
+    }
+    return Result;
+}
+
 ak_json_str AK_Json__Json_Str_To_UTF8(ak_json__arena* Arena, ak_json_str JsonStr)
 {
+    if(!JsonStr.Length)
+    {
+        ak_json_str Result;
+        Result.Length = 0;
+        Result.Str = NULL;
+        return Result;
+    }
+    
     ak_json__arena_reserve Reserve = AK_Json__Arena_Begin_Reserve(Arena, JsonStr.Length+1);
     
     ak_json_u64 Index;
@@ -517,31 +549,111 @@ ak_json_str AK_Json__Json_Str_To_UTF8(ak_json__arena* Arena, ak_json_str JsonStr
     {
         if(JsonStr.Str[Index] == '\\')
         {
-            if(JsonStr.Str[Index+1] == 'u')
+            switch(JsonStr.Str[Index+1])
             {
-                unsigned int Codepoint = ((JsonStr.Str[Index+5] << 24) | 
-                                          (JsonStr.Str[Index+4] << 16) | 
-                                          (JsonStr.Str[Index+3] << 8)  | 
-                                          (JsonStr.Str[Index+2] << 0));
-                unsigned int ByteCount = AK_Json__Get_UTF8_Bytecount(Codepoint);
-                ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, ByteCount);
-                AK_Json__UTF8_From_Codepoint(Codepoint, Memory);
-                Index += 5;
-                continue;
+                case 'u':
+                {
+                    ak_json_u64 UniIndex;
+                    
+                    unsigned int ValueUTF16 = 0;
+                    for(UniIndex = 0; UniIndex < 4; UniIndex++)
+                    {
+                        unsigned int Value;
+                        unsigned int Byte = JsonStr.Str[Index+2+UniIndex];
+                        if(Byte >= '0' && Byte <= '9')
+                        {
+                            Value = Byte - 48;
+                        }
+                        else if(Byte >= 'a' && Byte <= 'f')
+                        {
+                            Value = Byte - 97 + 10;
+                        }
+                        else if(Byte >= 'A' && Byte <= 'F')
+                        {
+                            Value = Byte - 65 + 10;
+                        }
+                        
+                        ValueUTF16 |= (Value << 4*(3-UniIndex));
+                    }
+                    
+                    unsigned int ValueUTF32 = AK_Json__UTF16_To_UTF32(ValueUTF16);
+                    
+                    unsigned int ByteCount = AK_Json__Get_UTF8_Bytecount(ValueUTF32);
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, ByteCount);
+                    AK_Json__UTF8_From_Codepoint(ValueUTF32, Memory);
+                    Index += 5;
+                } break;
+                
+                case '"':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '"';
+                    Index += 1;
+                } break;
+                
+                case '\\':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '\\';
+                    Index += 1;
+                } break;
+                
+                case 'b':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '\b';
+                    Index += 1;
+                } break;
+                
+                case 'f':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '\f';
+                    Index += 1;
+                } break;
+                
+                case 'n':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '\n';
+                    Index += 1;
+                } break;
+                
+                case 'r':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '\r';
+                    Index += 1;
+                } break;
+                
+                case 't':
+                {
+                    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+                    *Memory = '\t';
+                    Index += 1;
+                } break;
+                
+                default:
+                {
+                    //NOTE(EVERYONE): Should never happen
+                    AK_JSON_ASSERT(0);
+                } break;
             }
         }
-        
-        ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
-        *Memory = JsonStr.Str[Index];
+        else
+        {
+            ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+            *Memory = JsonStr.Str[Index];
+        }
     }
     
     ak_json_str Result;
     Result.Length = Reserve.Used;
     
-    ak_json_u8* Memory = AK_Json__Arena_Reserve_Get_Memory(&Reserve);
+    ak_json_u8* Memory = AK_Json__Arena_Push_Reserve(&Reserve, 1);
+    *Memory = 0;
     
-    Memory[Reserve.Used] = 0;
-    Result.Str = (const ak_json_u8*)Memory;
+    Result.Str = (const ak_json_u8*)AK_Json__Arena_Reserve_Get_Memory(&Reserve);
     
     AK_Json__Arena_End_Reserve(Arena, &Reserve);
     
@@ -865,8 +977,11 @@ static ak_json__token* AK_Json__Tokenizer_Allocate_Token(ak_json__tokenizer* Tok
 }
 
 #define AK_Json__Return_Undefined(Char) \
+do \
+{ \
 ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, Char); \
-return 0
+return 0; \
+} while(0)
 
 static int AK_Json__Tokenize_Null(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
 {
@@ -1036,7 +1151,6 @@ static int AK_Json__Tokenize_String(ak_json__tokenizer* Tokenizer, ak_json__stre
                 {
                     case '"':
                     case '\\':
-                    case '/':
                     case 'b':
                     case 'f':
                     case 'n':
@@ -1245,6 +1359,10 @@ static ak_json_value* AK_Json__Parse_String_Value(ak_json__arena* Arena, ak_json
     AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_STRING);
     
     ak_json_str TokenStr = AK_Json__Token_Get_Str(Str, Token);
+    
+    //NOTE(EVERYONE): Remove quotes from string
+    TokenStr.Str = TokenStr.Str+1;
+    TokenStr.Length -= 2;
     
     ak_json_value* Value = (ak_json_value*)AK_Json__Arena_Push(Arena, sizeof(ak_json_value));
     Value->Type = AK_JSON_VALUE_TYPE_STRING;

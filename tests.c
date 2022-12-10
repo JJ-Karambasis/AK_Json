@@ -67,6 +67,12 @@ UTEST(AK_Json, Simple_Success)
     ak_json_str Json8  = AK_Json_Str("null");
     ak_json_str Json9  = AK_Json_Str("true");
     ak_json_str Json10 = AK_Json_Str("false");
+    ak_json_str Json11 = AK_Json_Str("\"\"");
+    ak_json_str Json12 = AK_Json_Str("\"/\"");
+    ak_json_str Json13 = AK_Json_Str("\"\\\"\"");
+    ak_json_str Json14 = AK_Json_Str("\"\\uabcd\"");
+    ak_json_str Json15 = AK_Json_Str("\"Hello \\t \\uabcd World \\b\\n \\u15fc My name\"");
+    ak_json_str Json16 = AK_Json_Str("\"Hello \\uabcd\\n World \\u15fc My \\r name\"");
     
     ASSERT_FALSE(AK_Json_Parse(Context, Json0) == NULL);
     ASSERT_FALSE(AK_Json_Parse(Context, Json1) == NULL);
@@ -79,6 +85,12 @@ UTEST(AK_Json, Simple_Success)
     ASSERT_FALSE(AK_Json_Parse(Context, Json8) == NULL);
     ASSERT_FALSE(AK_Json_Parse(Context, Json9) == NULL);
     ASSERT_FALSE(AK_Json_Parse(Context, Json10) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json11) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json12) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json13) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json14) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json15) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json16) == NULL);
     
     AK_Json_Delete(Context);
 }
