@@ -20,7 +20,8 @@ typedef enum ak_json_error_code
     AK_JSON_ERROR_CODE_NONE,
     AK_JSON_ERROR_CODE_OUT_OF_MEMORY,
     AK_JSON_ERROR_CODE_UNDEFINED_TOKEN,
-    AK_JSON_ERROR_CODE_EXPECTED_END_OF_STREAM
+    AK_JSON_ERROR_CODE_EXPECTED_END_OF_STREAM,
+    AK_JSON_ERROR_CODE_ARRAY_PARSING
 } ak_json_error_code;
 
 typedef enum ak_json_value_type
@@ -440,7 +441,7 @@ static ak_json_str AK_Json_Str__Substr(ak_json_str Str, ak_json_u64 StartIndex, 
     AK_JSON_ASSERT(StartIndex < EndIndex);
     
     ak_json_str Result;
-    Result.Str = Str.Str;
+    Result.Str = Str.Str+StartIndex;
     Result.Length = EndIndex-StartIndex;
     return Result;
 }
@@ -925,7 +926,14 @@ typedef enum ak_json__token_type
     AK_JSON__TOKEN_TYPE_NULL,
     AK_JSON__TOKEN_TYPE_BOOLEAN,
     AK_JSON__TOKEN_TYPE_NUMBER,
-    AK_JSON__TOKEN_TYPE_STRING
+    AK_JSON__TOKEN_TYPE_STRING,
+    AK_JSON__TOKEN_TYPE_COMMA,
+    AK_JSON__TOKEN_TYPE_ARRAY_START,
+    AK_JSON__TOKEN_TYPE_ARRAY_END,
+    AK_JSON__TOKEN_TYPE_OBJECT_START,
+    AK_JSON__TOKEN_TYPE_OBJECT_END,
+    AK_JSON__TOKEN_TYPE_OBJECT_KEY_DELIMITER,
+    AK_JSON__TOKEN_TYPE_TERMINATOR
 } ak_json__token_type;
 
 typedef struct ak_json__token
@@ -982,6 +990,8 @@ do \
 ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, Char); \
 return 0; \
 } while(0)
+
+static int AK_Json__Tokenize_Generic(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream);
 
 static int AK_Json__Tokenize_Null(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
 {
@@ -1195,8 +1205,6 @@ static int AK_Json__Tokenize_String(ak_json__tokenizer* Tokenizer, ak_json__stre
     AK_Json__Return_Undefined(StartChar);
 }
 
-#undef AK_Json__Return_Undefined
-
 static int AK_Json__Tokenize_Value(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
 {
     AK_Json__Stream_Eat_Whitespace(Stream);
@@ -1248,33 +1256,127 @@ static int AK_Json__Tokenize_Value(ak_json__tokenizer* Tokenizer, ak_json__strea
     return Result;
 }
 
+static int AK_Json__Tokenize_Array(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
+{
+    ak_json__char StartChar = AK_Json__Stream_Consume_Char(Stream);
+    AK_JSON_ASSERT(StartChar.Char == '[');
+    
+    ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_ARRAY_START, StartChar);
+    Token->Length = 1;
+    
+    while(AK_Json__Stream_Is_Valid(Stream))
+    {
+        AK_Json__Stream_Eat_Whitespace(Stream);
+        
+        ak_json__char Char = AK_Json__Stream_Peek_Char(Stream);
+        if(Char.Char == ']')
+        {
+            Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_ARRAY_END, Char);
+            Token->Length = 1;
+            AK_Json__Stream_Increment(Stream);
+            return 1;
+        }
+        else if(Char.Char == ',')
+        {
+            Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_COMMA, Char);
+            Token->Length = 1;
+            AK_Json__Stream_Increment(Stream);
+        }
+        else
+        {
+            if(!AK_Json__Tokenize_Generic(Tokenizer, Stream))
+                return 0;
+        }
+    }
+    
+    //NOTE(EVERYONE): Allocate an undefined token and handle the error later
+    Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
+    Token->Length = 0;
+    
+    return 1;
+}
+
+static int AK_Json__Tokenize_Object(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
+{
+    ak_json__char StartChar = AK_Json__Stream_Consume_Char(Stream);
+    AK_JSON_ASSERT(StartChar.Char == '{');
+    
+    ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_OBJECT_START, StartChar);
+    Token->Length = 1;
+    
+    while(AK_Json__Stream_Is_Valid(Stream))
+    {
+        AK_Json__Stream_Eat_Whitespace(Stream);
+        
+        ak_json__char Char = AK_Json__Stream_Peek_Char(Stream);
+        
+        if(Char.Char == '}')
+        {
+            ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_OBJECT_END, Char);
+            Token->Length = 1;
+            AK_Json__Stream_Increment(Stream);
+            return 1;
+        }
+        else if(Char.Char == ':')
+        {
+            ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_OBJECT_KEY_DELIMITER, Char);
+            Token->Length = 1;
+            AK_Json__Stream_Increment(Stream);
+        }
+        else if(Char.Char == ',')
+        {
+            ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_COMMA, Char);
+            Token->Length = 1;
+            AK_Json__Stream_Increment(Stream);
+        }
+        else
+        {
+            if(!AK_Json__Tokenize_Generic(Tokenizer, Stream))
+                return 0;
+        }
+    }
+    
+    //NOTE(EVERYONE): Allocate an undefined token and handle the error later
+    Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_UNDEFINED, StartChar);
+    Token->Length = 0;
+    
+    return 1;
+}
+
+static int AK_Json__Tokenize_Generic(ak_json__tokenizer* Tokenizer, ak_json__stream* Stream)
+{
+    int Result = 0;
+    if(AK_Json__Stream_Is_Valid(Stream))
+    {
+        ak_json__char Char = AK_Json__Stream_Peek_Char(Stream);
+        switch(Char.Char)
+        {
+            case '{':
+            {
+                Result = AK_Json__Tokenize_Object(Tokenizer, Stream);
+            } break;
+            
+            case '[':
+            {
+                Result = AK_Json__Tokenize_Array(Tokenizer, Stream);
+            } break;
+            
+            default:
+            {
+                Result = AK_Json__Tokenize_Value(Tokenizer, Stream);
+            } break;
+        }
+    }
+    
+    return Result;
+}
+
 static int AK_Json__Tokenize(ak_json__tokenizer* Tokenizer, ak_json_str Str)
 {
     ak_json__stream Stream = AK_Json__Stream_Create(Str);
     AK_Json__Stream_Eat_Whitespace(&Stream);
     
-    int Result = 0;
-    if(AK_Json__Stream_Is_Valid(&Stream))
-    {
-        ak_json__char Char = AK_Json__Stream_Peek_Char(&Stream);
-        switch(Char.Char)
-        {
-            case '{':
-            {
-                //Result = AK_Json__Tokenize_Object(Tokenizer, Stream);
-            } break;
-            
-            case '[':
-            {
-                //Result = AK_Json__Tokenize_Array(Tokenizer, Stream);
-            } break;
-            
-            default:
-            {
-                Result = AK_Json__Tokenize_Value(Tokenizer, &Stream);
-            } break;
-        }
-    }
+    int Result = AK_Json__Tokenize_Generic(Tokenizer, &Stream);
     
     if(Result)
     {
@@ -1287,9 +1389,360 @@ static int AK_Json__Tokenize(ak_json__tokenizer* Tokenizer, ak_json_str Str)
             AK_Json__Error_Log(Tokenizer->ErrorArena, Str, AK_JSON_ERROR_CODE_EXPECTED_END_OF_STREAM, Char, AK_JSON__INTERNAL_ERROR_EXPECTED_EOF);
             return 0;
         }
+        
+        ak_json__char Char;
+        AK_Json__Memory_Clear(&Char, sizeof(ak_json__char));
+        ak_json__token* Token = AK_Json__Tokenizer_Allocate_Token(Tokenizer, AK_JSON__TOKEN_TYPE_TERMINATOR, Char);
     }
     
     return Result;
+}
+
+#undef AK_Json__Return_Undefined
+
+typedef enum ak_json__object_parsing_state
+{
+    AK_JSON__OBJECT_PARSING_STATE_INITIAL,
+    AK_JSON__OBJECT_PARSING_STATE_KEY,
+    AK_JSON__OBJECT_PARSING_STATE_DELIMTER,
+    AK_JSON__OBJECT_PARSING_STATE_VALUE,
+    AK_JSON__OBJECT_PARSING_STATE_COMMA
+} ak_json__object_parsing_state;
+
+typedef struct ak_json__tmp_key
+{
+    ak_json_str                Key;
+    struct ak_json__tmp_value* TmpValue;
+    struct ak_json__tmp_key*   Next;
+} ak_json__tmp_key;
+
+typedef struct ak_json__tmp_object
+{
+    unsigned int             Count;
+    struct ak_json__tmp_key* First;
+    struct ak_json__tmp_key* Last;
+} ak_json__tmp_object;
+
+typedef struct ak_json__tmp_array
+{
+    unsigned int               Count;
+    struct ak_json__tmp_value* First;
+    struct ak_json__tmp_value* Last;
+} ak_json__tmp_array;
+
+typedef struct ak_json__tmp_value
+{
+    ak_json_value_type Type;
+    union
+    {
+        ak_json_str    String;
+        int            Boolean;
+        double         Number;
+        ak_json__tmp_array  Array;
+        ak_json__tmp_object Object;
+    };
+    
+    struct ak_json__tmp_value* Next;
+} ak_json__tmp_value;
+
+typedef struct ak_json__parser
+{
+    ak_json__arena*     Arena;
+    ak_json__arena*     ErrorArena;
+    ak_json_str         Str;
+    ak_json__token_list Tokens;
+    ak_json__token*     CurrentToken;
+} ak_json__parser;
+
+static ak_json__tmp_value* AK_Json__Parse_Generic(ak_json__parser* Parser);
+
+static ak_json__token* AK_Json__Parser_Peek_Token(ak_json__parser* Parser)
+{
+    return Parser->CurrentToken;
+}
+
+static void AK_Json__Parser_Increment_Token(ak_json__parser* Parser)
+{
+    Parser->CurrentToken = Parser->CurrentToken->Next;
+}
+
+static ak_json__token* AK_Json__Parser_Consume_Token(ak_json__parser* Parser)
+{
+    ak_json__token* Result = AK_Json__Parser_Peek_Token(Parser);
+    AK_Json__Parser_Increment_Token(Parser);
+    return Result;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_Null_Value(ak_json__parser* Parser)
+{
+    ak_json__token* Token = AK_Json__Parser_Consume_Token(Parser);
+    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_NULL);
+    ak_json__tmp_value* Value = (ak_json__tmp_value*)AK_Json__Arena_Push(Parser->Arena, sizeof(ak_json__tmp_value));
+    Value->Type = AK_JSON_VALUE_TYPE_NULL;
+    return Value;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_Boolean_Value(ak_json__parser* Parser)
+{
+    ak_json__token* Token = AK_Json__Parser_Consume_Token(Parser);
+    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_BOOLEAN);
+    ak_json_str TokenStr = AK_Json__Token_Get_Str(Parser->Str, Token);
+    
+    int Boolean = AK_Json_Str__Equal(TokenStr, AK_Json_Str("true")) ? 1 : 0;
+    ak_json__tmp_value* Value = (ak_json__tmp_value*)AK_Json__Arena_Push(Parser->Arena, sizeof(ak_json__tmp_value));
+    Value->Type = AK_JSON_VALUE_TYPE_BOOLEAN;
+    Value->Boolean = Boolean;
+    return Value;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_Number_Value(ak_json__parser* Parser)
+{
+    ak_json__token* Token = AK_Json__Parser_Consume_Token(Parser);
+    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_NUMBER);
+    
+    ak_json_str TokenStr = AK_Json__Token_Get_Str(Parser->Str, Token);
+    
+    ak_json__tmp_value* Value = (ak_json__tmp_value*)AK_Json__Arena_Push(Parser->Arena, sizeof(ak_json__tmp_value));
+    Value->Type = AK_JSON_VALUE_TYPE_NUMBER;
+    Value->Number = AK_JSON_ATOF((const char*)TokenStr.Str);
+    return Value;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_String_Value(ak_json__parser* Parser)
+{
+    ak_json__token* Token = AK_Json__Parser_Consume_Token(Parser);
+    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_STRING);
+    
+    ak_json_str TokenStr = AK_Json__Token_Get_Str(Parser->Str, Token);
+    
+    //NOTE(EVERYONE): Remove quotes from string
+    TokenStr.Str = TokenStr.Str+1;
+    TokenStr.Length -= 2;
+    
+    ak_json__tmp_value* Value = (ak_json__tmp_value*)AK_Json__Arena_Push(Parser->Arena, sizeof(ak_json__tmp_value));
+    Value->Type = AK_JSON_VALUE_TYPE_STRING;
+    Value->String = AK_Json__Json_Str_To_UTF8(Parser->Arena, TokenStr);
+    
+    return Value;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_Array_Value(ak_json__parser* Parser)
+{
+    ak_json__token* StartToken = AK_Json__Parser_Consume_Token(Parser);
+    AK_JSON_ASSERT(StartToken->Type == AK_JSON__TOKEN_TYPE_ARRAY_START);
+    
+    int HasFinishedCorrectly = 0;
+    
+    ak_json__tmp_value* Value = (ak_json__tmp_value*)AK_Json__Arena_Push(Parser->Arena, sizeof(ak_json__tmp_value));
+    Value->Type = AK_JSON_VALUE_TYPE_ARRAY;
+    ak_json__tmp_array* Array = &Value->Array;
+    Array->Count = 0;
+    Array->First = Array->Last = NULL;
+    
+    int NeedsValue = 1;
+    int CanFinish = 1;
+    ak_json__token* Token = AK_Json__Parser_Peek_Token(Parser);
+    
+    while(Token && !HasFinishedCorrectly)
+    {
+        switch(Token->Type)
+        {
+            case AK_JSON__TOKEN_TYPE_ARRAY_END:
+            {
+                if(!CanFinish) 
+                {
+                    //TODO(JJ): Diagnostic and error logging
+                    return NULL;
+                }
+                HasFinishedCorrectly = 1;
+                AK_Json__Parser_Increment_Token(Parser);
+            } break;
+            
+            case AK_JSON__TOKEN_TYPE_COMMA:
+            {
+                if(NeedsValue)
+                {
+                    //TODO(JJ): Error logging
+                    return NULL;
+                }
+                
+                AK_Json__Parser_Increment_Token(Parser);
+                NeedsValue = 1;
+                CanFinish = 0;
+            } break;
+            
+            default:
+            {
+                if(!NeedsValue)
+                {
+                    //TODO(JJ): Error logging
+                    return NULL;
+                }
+                
+                ak_json__tmp_value* Value = AK_Json__Parse_Generic(Parser);
+                
+                if(!Array->First) Array->First = Value;
+                else Array->Last->Next = Value;
+                Array->Last = Value;
+                
+                Array->Count++;
+                
+                NeedsValue = 0;
+                CanFinish = 1;
+            } break;
+        }
+        
+        Token = AK_Json__Parser_Peek_Token(Parser);
+    }
+    
+    if(!HasFinishedCorrectly)
+    {
+        AK_Json__Error_Log(Parser->ErrorArena, Parser->Str, AK_JSON_ERROR_CODE_ARRAY_PARSING, StartToken->StartChar, AK_Json_Str("Error parsing array. Expected , or ] characters. Got EOF."));
+        return NULL;
+    }
+    
+    return Value;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_Object(ak_json__parser* Parser)
+{
+    ak_json__token* StartToken = AK_Json__Parser_Consume_Token(Parser);
+    AK_JSON_ASSERT(StartToken->Type == AK_JSON__TOKEN_TYPE_OBJECT_START);
+    
+    int HasFinishedCorrectly = 0;
+    
+    ak_json__tmp_value* Value = (ak_json__tmp_value*)AK_Json__Arena_Push(Parser->Arena, sizeof(ak_json__tmp_value));
+    Value->Type = AK_JSON_VALUE_TYPE_OBJECT;
+    
+    ak_json__tmp_object* Object = &Value->Object;
+    
+    ak_json__object_parsing_state ParsingState = AK_JSON__OBJECT_PARSING_STATE_INITIAL;
+    
+    ak_json__token* Token = AK_Json__Parser_Peek_Token(Parser);
+    while(Token && !HasFinishedCorrectly)
+    {
+        switch(Token->Type)
+        {
+            case AK_JSON__TOKEN_TYPE_OBJECT_END:
+            {
+                if((ParsingState == AK_JSON__OBJECT_PARSING_STATE_INITIAL) || 
+                   (ParsingState == AK_JSON__OBJECT_PARSING_STATE_VALUE))
+                {
+                    HasFinishedCorrectly = 1;
+                    AK_Json__Parser_Increment_Token(Parser);
+                }
+                else
+                {
+                    //TODO(JJ): Diagnostic and error logging
+                    return NULL;
+                }
+            } break;
+            
+            case AK_JSON__TOKEN_TYPE_OBJECT_KEY_DELIMITER:
+            {
+                if(ParsingState == AK_JSON__OBJECT_PARSING_STATE_KEY)
+                {
+                    AK_Json__Parser_Increment_Token(Parser);
+                    ParsingState = AK_JSON__OBJECT_PARSING_STATE_DELIMTER;
+                }
+                else
+                {
+                    //TODO(JJ): Diagnostic and error logging
+                    return NULL;
+                }
+            } break;
+            
+            case AK_JSON__TOKEN_TYPE_COMMA:
+            {
+                if(ParsingState == AK_JSON__OBJECT_PARSING_STATE_VALUE)
+                {
+                    AK_Json__Parser_Increment_Token(Parser);
+                    ParsingState = AK_JSON__OBJECT_PARSING_STATE_COMMA;
+                }
+                else
+                {
+                    //TODO(JJ): Diagnostic and error logging
+                    return NULL;
+                }
+            } break;
+            
+            default:
+            {
+                if(ParsingState == AK_JSON__OBJECT_PARSING_STATE_INITIAL || 
+                   ParsingState == AK_JSON__OBJECT_PARSING_STATE_COMMA)
+                {
+                    if(Token->Type != AK_JSON__TOKEN_TYPE_STRING)
+                    {
+                        //TODO(JJ): Diagnostic and error logging
+                        return NULL;
+                    }
+                    ParsingState = AK_JSON__OBJECT_PARSING_STATE_KEY;
+                    
+                    //TODO(JJ): Parsing key here
+                }
+                else if(ParsingState == AK_JSON__OBJECT_PARSING_STATE_DELIMTER)
+                {
+                    ParsingState = AK_JSON__OBJECT_PARSING_STATE_VALUE;
+                    
+                    //TODO(JJ): Parsing value here
+                }
+                else
+                {
+                    //TODO(JJ): Diagnostic and error logging
+                    return NULL;
+                }
+            } break;
+        }
+    }
+    
+    if(!HasFinishedCorrectly)
+    {
+        //TODO(JJ): Diagnostic and error logging
+        return NULL;
+    }
+    
+    return Value;
+}
+
+static ak_json__tmp_value* AK_Json__Parse_Generic(ak_json__parser* Parser)
+{
+    ak_json__token* Token = AK_Json__Parser_Peek_Token(Parser);
+    
+    ak_json__tmp_value* RootValue = NULL;
+    switch(Token->Type)
+    {
+        case AK_JSON__TOKEN_TYPE_NULL:
+        {
+            RootValue = AK_Json__Parse_Null_Value(Parser);
+        } break;
+        
+        case AK_JSON__TOKEN_TYPE_BOOLEAN:
+        {
+            RootValue = AK_Json__Parse_Boolean_Value(Parser);
+        } break;
+        
+        case AK_JSON__TOKEN_TYPE_NUMBER:
+        {
+            RootValue = AK_Json__Parse_Number_Value(Parser);
+        } break;
+        
+        case AK_JSON__TOKEN_TYPE_STRING:
+        {
+            RootValue = AK_Json__Parse_String_Value(Parser);
+        } break;
+        
+        case AK_JSON__TOKEN_TYPE_ARRAY_START:
+        {
+            RootValue = AK_Json__Parse_Array_Value(Parser);
+        } break;
+        
+        default:
+        {
+            //TODO(JJ): Implement this case
+        } break;
+    }
+    
+    return RootValue;
 }
 
 typedef struct ak_json_object
@@ -1298,6 +1751,9 @@ typedef struct ak_json_object
 
 typedef struct ak_json_array
 {
+    unsigned int          Count;
+    struct ak_json_value* First;
+    struct ak_json_value* Last;
 } ak_json_array;
 
 typedef struct ak_json_value
@@ -1312,73 +1768,18 @@ typedef struct ak_json_value
         ak_json_object Object;
     };
     
-    ak_json_value* Next;
+    struct ak_json_value* Prev;
+    struct ak_json_value* Next;
 } ak_json_value;
 
-typedef struct ak_json_key
-{
-    ak_json_str    Str;
-    ak_json_value* Value;
-    ak_json_key*   Next;
-} ak_json_key;
-
-static ak_json_value* AK_Json__Parse_Null_Value(ak_json__arena* Arena, ak_json_str Str, ak_json__token* Token)
-{
-    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_NULL);
-    ak_json_value* Value = (ak_json_value*)AK_Json__Arena_Push(Arena, sizeof(ak_json_value));
-    Value->Type = AK_JSON_VALUE_TYPE_NULL;
-    return Value;
-}
-
-static ak_json_value* AK_Json__Parse_Boolean_Value(ak_json__arena* Arena, ak_json_str Str, ak_json__token* Token)
-{
-    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_BOOLEAN);
-    ak_json_str TokenStr = AK_Json__Token_Get_Str(Str, Token);
-    
-    int Boolean = AK_Json_Str__Equal(TokenStr, AK_Json_Str("true")) ? 1 : 0;
-    ak_json_value* Value = (ak_json_value*)AK_Json__Arena_Push(Arena, sizeof(ak_json_value));
-    Value->Type = AK_JSON_VALUE_TYPE_BOOLEAN;
-    Value->Boolean = Boolean;
-    return Value;
-}
-
-static ak_json_value* AK_Json__Parse_Number_Value(ak_json__arena* Arena, ak_json_str Str, ak_json__token* Token)
-{
-    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_NUMBER);
-    
-    ak_json_str TokenStr = AK_Json__Token_Get_Str(Str, Token);
-    
-    ak_json_value* Value = (ak_json_value*)AK_Json__Arena_Push(Arena, sizeof(ak_json_value));
-    Value->Type = AK_JSON_VALUE_TYPE_NUMBER;
-    Value->Number = AK_JSON_ATOF((const char*)TokenStr.Str);
-    return Value;
-}
-
-static ak_json_value* AK_Json__Parse_String_Value(ak_json__arena* Arena, ak_json_str Str, ak_json__token* Token)
-{
-    AK_JSON_ASSERT(Token->Type == AK_JSON__TOKEN_TYPE_STRING);
-    
-    ak_json_str TokenStr = AK_Json__Token_Get_Str(Str, Token);
-    
-    //NOTE(EVERYONE): Remove quotes from string
-    TokenStr.Str = TokenStr.Str+1;
-    TokenStr.Length -= 2;
-    
-    ak_json_value* Value = (ak_json_value*)AK_Json__Arena_Push(Arena, sizeof(ak_json_value));
-    Value->Type = AK_JSON_VALUE_TYPE_STRING;
-    Value->String = AK_Json__Json_Str_To_UTF8(Arena, TokenStr);
-    
-    return Value;
-}
-
-static ak_json_value* AK_Json__Value_Copy(ak_json_context* Context, ak_json_value* CopyValue)
+static ak_json_value* AK_Json__Value_Copy(ak_json_context* Context, ak_json__tmp_value* TmpValue)
 {
     ak_json_value* Value = Context->FreeValues;
     if(!Value) Value = (ak_json_value*)AK_Json__Arena_Push(Context->Arena, sizeof(ak_json_value));
     else Context->FreeValues = Context->FreeValues->Next;
     
-    Value->Type = CopyValue->Type;
-    switch(CopyValue->Type)
+    Value->Type = TmpValue->Type;
+    switch(TmpValue->Type)
     {
         case AK_JSON_VALUE_TYPE_NULL:
         {
@@ -1387,22 +1788,39 @@ static ak_json_value* AK_Json__Value_Copy(ak_json_context* Context, ak_json_valu
         
         case AK_JSON_VALUE_TYPE_BOOLEAN:
         {
-            Value->Boolean = CopyValue->Boolean;
+            Value->Boolean = TmpValue->Boolean;
         } break;
         
         case AK_JSON_VALUE_TYPE_NUMBER:
         {
-            Value->Number = CopyValue->Number;
+            Value->Number = TmpValue->Number;
         } break;
         
         case AK_JSON_VALUE_TYPE_STRING:
         {
-            Value->String = AK_Json_Str__Copy(Context->Arena, CopyValue->String);
+            Value->String = AK_Json_Str__Copy(Context->Arena, TmpValue->String);
         } break;
         
         case AK_JSON_VALUE_TYPE_ARRAY:
         {
-            //TODO(JJ): Not implemented
+            ak_json_array* Array = &Value->Array;
+            Array->Count = TmpValue->Array.Count;
+            Array->First = NULL;
+            Array->Last  = NULL;
+            
+            ak_json__tmp_value* ArrayTmpValue;
+            for(ArrayTmpValue = TmpValue->Array.First; ArrayTmpValue; ArrayTmpValue = ArrayTmpValue->Next)
+            {
+                ak_json_value* TmpValue = AK_Json__Value_Copy(Context, ArrayTmpValue);
+                
+                if(!Array->First) Array->First = TmpValue;
+                else 
+                {
+                    TmpValue->Prev    = Array->Last;
+                    Array->Last->Next = TmpValue;
+                }
+                Array->Last = TmpValue;
+            }
         } break;
         
         case AK_JSON_VALUE_TYPE_OBJECT:
@@ -1429,37 +1847,14 @@ AK_JSON_DEF ak_json_value* AK_Json_Parse(ak_json_context* Context, ak_json_str S
         return NULL;
     }
     
-    ak_json__token* Token = Tokenizer.Tokens.First;
+    ak_json__parser Parser;
+    Parser.Arena        = Context->Arena;
+    Parser.ErrorArena   = Context->Arena;
+    Parser.Str          = Str;
+    Parser.Tokens       = Tokenizer.Tokens;
+    Parser.CurrentToken = Parser.Tokens.First;
     
-    ak_json_value* RootValue = NULL;
-    switch(Token->Type)
-    {
-        case AK_JSON__TOKEN_TYPE_NULL:
-        {
-            RootValue = AK_Json__Parse_Null_Value(ParseArena, Str, Token);
-        } break;
-        
-        case AK_JSON__TOKEN_TYPE_BOOLEAN:
-        {
-            RootValue = AK_Json__Parse_Boolean_Value(ParseArena, Str, Token);
-        } break;
-        
-        case AK_JSON__TOKEN_TYPE_NUMBER:
-        {
-            RootValue = AK_Json__Parse_Number_Value(ParseArena, Str, Token);
-        } break;
-        
-        case AK_JSON__TOKEN_TYPE_STRING:
-        {
-            RootValue = AK_Json__Parse_String_Value(ParseArena, Str, Token);
-        } break;
-        
-        default:
-        {
-            //NOTE(EVERYONE): This shouldn't occur
-            AK_JSON_ASSERT(0);
-        } break;
-    }
+    ak_json__tmp_value* RootValue = AK_Json__Parse_Generic(&Parser);
     
     ak_json_value* Result = NULL;
     if(RootValue) Result = AK_Json__Value_Copy(Context, RootValue);
@@ -1472,6 +1867,7 @@ AK_JSON_DEF ak_json_value* AK_Json_Parse(ak_json_context* Context, ak_json_str S
 *** Keys ***
 ************/
 
+#if 0 
 AK_JSON_DEF ak_json_str AK_Json_Key_Get_Name(ak_json_key* Key)
 {
     return Key->Str;
@@ -1481,6 +1877,7 @@ AK_JSON_DEF ak_json_value* AK_Json_Key_Get_Value(ak_json_key* Key)
 {
     return Key->Value;
 }
+#endif
 
 /*************
 *** Values ***

@@ -95,6 +95,21 @@ UTEST(AK_Json, Simple_Success)
     AK_Json_Delete(Context);
 }
 
+UTEST(AK_Json, Simple_Array)
+{
+    ak_json_context* Context = AK_Json_Create(NULL);
+    
+    ak_json_str Json0 = AK_Json_Str("[]");
+    ak_json_str Json1 = AK_Json_Str("[123]");
+    ak_json_str Json2 = AK_Json_Str("[\"\\uabcd\", 123, null, false, -0.2e4]");
+    
+    ASSERT_FALSE(AK_Json_Parse(Context, Json0) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json1) == NULL);
+    ASSERT_FALSE(AK_Json_Parse(Context, Json2) == NULL);
+    
+    AK_Json_Delete(Context);
+}
+
 UTEST(AK_Json, Simple_Error)
 {
     ak_json_context* Context = AK_Json_Create(NULL);
